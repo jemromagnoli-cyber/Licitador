@@ -6,6 +6,8 @@ import { db } from "@/db/client";
 import { sql } from "drizzle-orm";
 import { tenders } from "@/db/schema";
 
+   export const dynamic = "force-dynamic";
+
 async function getStats() {
   try {
     const [row] = await db
