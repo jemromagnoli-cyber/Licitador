@@ -2,6 +2,7 @@ import { Navbar } from "@/components/marketing/Navbar";
 import { Footer } from "@/components/marketing/Footer";
 import { db } from "@/db/client";
 import { sources } from "@/db/schema";
+   export const dynamic = "force-dynamic";
 
 export default async function CoberturaPage() {
   const allSources = await db.select().from(sources);
