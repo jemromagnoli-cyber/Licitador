@@ -3,6 +3,7 @@ import { getCurrentUser } from "@/lib/auth/session";
 import { db } from "@/db/client";
 import { computeFitScore } from "@/lib/scoring/fit-score";
 import { setTrackingStage } from "@/lib/actions/tracking";
+import { isTenderStillOpen } from "@/lib/tenders/relevance";
 
 const TABS = [
   { key: "nuevas", label: "Nuevas", stages: ["nueva"] },
@@ -41,7 +42,13 @@ export default async function OportunidadesPage({
 
   let filtered = allTenders.filter((t) => {
     const stage = stageByTenderId.get(t.id) ?? "nueva";
-    return activeTab.stages.includes(stage as never);
+    if (!activeTab.stages.includes(stage as never)) return false;
+    // Solo en "Nuevas" (oportunidades todavía sin evaluar) escondemos las
+    // que ya cerraron o vencieron — no tiene sentido ofrecerlas para
+    // presentarse. En "Guardadas"/"Descartadas" queda la decisión ya
+    // tomada por la empresa, se ve igual aunque el proceso haya cerrado.
+    if (activeTab.key === "nuevas" && !isTenderStillOpen(t)) return false;
+    return true;
   });
 
   if (q) {
