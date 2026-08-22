@@ -23,8 +23,8 @@ const SOURCES: (typeof sources.$inferInsert)[] = [
     jurisdictionName: "CABA",
     baseUrl: "https://data.buenosaires.gob.ar",
     connectorKey: "bac-ocds",
-    // Inactiva hasta confirmar BAC_OCDS_URL en producción (ver bac-ocds.ts).
-    active: false,
+    // URL real confirmada (ver bac-ocds.ts) — activa.
+    active: true,
   },
   {
     key: "contratar-ckan",
