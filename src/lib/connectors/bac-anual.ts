@@ -21,13 +21,13 @@ import type { NormalizedTender, TenderSource, TenderSourceResult, TenderStatus }
  * que descarta estados terminales y fechas de cierre pasadas), el
  * resultado neto es: solo procesos de este año que además siguen abiertos.
  *
- * OJO — el archivo sigue siendo CSV y no pudimos inspeccionar sus columnas
- * reales desde el entorno de desarrollo (supera el límite de preview del
- * portal y de nuestras herramientas de research). Los nombres en
- * COLUMN_CANDIDATES y STATUS_KEYWORDS son la mejor estimación posible
- * basada en la terminología típica de compras públicas argentinas — hace
- * falta un primer test real (ver ingest_runs) para confirmar/ajustar,
- * igual que se hizo con el conector de CONTRAT.AR.
+ * IMPORTANTE — aunque el portal lo etiqueta como CSV, probado en producción
+ * resultó ser un export de OCDS "aplanado" (flattened OCDS): cada fila es
+ * un proceso, y las columnas son los mismos campos que usa el estándar
+ * OCDS pero con rutas tipo "tender/title", "tender/status",
+ * "tender/procuringEntity/name" en vez de JSON anidado. Los nombres de
+ * columna de abajo están confirmados contra un resultado real de
+ * producción (ver ingest_runs), no son una estimación.
  */
 
 const CSV_URL =
@@ -36,51 +36,47 @@ const CSV_URL =
 
 const DEFAULT_JURISDICTION = "CABA";
 
+// Primero los nombres reales confirmados (flattened OCDS, separador "/"),
+// después algunos alias en español por si el portal cambia el formato de
+// exportación más adelante.
 const COLUMN_CANDIDATES: Record<string, string[]> = {
-  id: [
-    "numero_proceso",
-    "nro_proceso",
-    "número_de_proceso",
-    "numero_de_proceso",
-    "id_proceso",
-    "proceso",
-    "expediente",
-    "id",
-  ],
-  title: ["objeto", "objeto_de_la_contratacion", "objeto_contratacion", "descripcion", "detalle"],
-  organismo: [
-    "reparticion",
-    "repartición",
-    "reparticion_compradora",
-    "unidad_ejecutora",
-    "organismo",
-    "dependencia",
-    "unidad_operativa_de_adquisiciones",
-  ],
-  procedureType: ["tipo_de_procedimiento", "tipo_procedimiento", "modalidad", "procedimiento", "tipo_de_proceso"],
-  status: ["estado", "estado_del_proceso", "situacion", "situación"],
-  publishedAt: ["fecha_de_publicacion", "fecha_publicacion", "fecha_inicio", "fecha_de_inicio"],
-  closingAt: [
-    "fecha_de_apertura",
-    "fecha_apertura",
-    "fecha_limite",
-    "fecha_límite",
-    "fecha_de_cierre",
-    "fecha_cierre",
-  ],
-  amount: ["presupuesto_oficial", "monto_estimado", "monto", "importe"],
-  url: ["url", "link", "enlace"],
+  id: ["tender/id", "ocid", "numero_proceso", "nro_proceso", "expediente", "id"],
+  title: ["tender/title", "objeto", "objeto_de_la_contratacion", "descripcion"],
+  organismo: ["tender/procuringEntity/name", "parties/0/name", "reparticion", "organismo"],
+  procedureType: ["tender/procurementMethodDetails", "tender/procurementMethod", "tipo_de_procedimiento"],
+  category: ["tender/mainProcurementCategory", "rubro", "categoria"],
+  status: ["tender/status", "estado", "estado_del_proceso"],
+  publishedAt: ["date", "tender/tenderPeriod/startDate", "fecha_de_publicacion"],
+  closingAt: ["tender/tenderPeriod/endDate", "fecha_de_apertura", "fecha_de_cierre"],
+  amount: ["tender/value/amount", "presupuesto_oficial", "monto"],
+  currency: ["tender/value/currency", "moneda"],
+  url: ["tender/documents/0/url", "url", "link"],
+};
+
+// Igual que en ocds.ts — mismo estándar OCDS, mismos valores de status en
+// inglés. Confirmado contra un resultado real de producción.
+const STATUS_MAP: Record<string, TenderStatus> = {
+  planning: "publicada",
+  planned: "publicada",
+  active: "abierta",
+  cancelled: "cancelada",
+  unsuccessful: "desierta",
+  complete: "cerrada",
+  withdrawn: "cancelada",
 };
 
 function findColumn(headerRow: string[], field: keyof typeof COLUMN_CANDIDATES): string | undefined {
   const candidates = COLUMN_CANDIDATES[field] ?? [];
+  // Normaliza sacando tildes/diacríticos y todo lo que no sea alfanumérico
+  // o "/" — así "Número de Proceso" matchea "numero_de_proceso" Y
+  // preservamos el separador de rutas OCDS aplanadas ("tender/title").
   const normalize = (s: string) =>
     s
       .trim()
       .toLowerCase()
       .normalize("NFD")
-      .replace(/[̀-ͯ]/g, "") // saca tildes/diacríticos
-      .replace(/[^a-z0-9]/g, ""); // saca espacios/guiones/underscores para comparar "Número de Proceso" con "numero_de_proceso"
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9/]/g, "");
   const normalizedHeaders = headerRow.map(normalize);
   for (const candidate of candidates) {
     const idx = normalizedHeaders.indexOf(normalize(candidate));
@@ -102,22 +98,19 @@ function parseDate(raw: string | undefined): Date | undefined {
   return Number.isNaN(d.getTime()) ? undefined : d;
 }
 
-// Mapeo por palabras clave (no por valor exacto) porque no conocemos el
-// texto exacto que usa el CSV real todavía.
 function mapStatus(raw: string | undefined): TenderStatus {
   if (!raw) return "publicada";
-  const s = raw
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "");
+  const key = raw.trim().toLowerCase();
+  if (STATUS_MAP[key]) return STATUS_MAP[key];
+  // Fallback por si en algún momento el export trae texto en español en
+  // vez de los valores OCDS en inglés.
+  const s = key.normalize("NFD").replace(/[̀-ͯ]/g, "");
   if (s.includes("adjudic")) return "adjudicada";
   if (s.includes("desiert") || s.includes("fracas")) return "desierta";
-  if (s.includes("cancel") || s.includes("anulad") || s.includes("revocad")) return "cancelada";
-  if (s.includes("cerrad") || s.includes("finaliz")) return "cerrada";
+  if (s.includes("cancel") || s.includes("anulad")) return "cancelada";
+  if (s.includes("cerrad") || s.includes("finaliz") || s.includes("complet")) return "cerrada";
   if (s.includes("consulta")) return "en_consulta";
-  if (s.includes("abiert") || s.includes("convocat") || s.includes("public") || s.includes("proceso")) {
-    return "abierta";
-  }
+  if (s.includes("abiert") || s.includes("activ") || s.includes("convocat")) return "abierta";
   return "publicada";
 }
 
@@ -161,10 +154,12 @@ export function createBacAnualSource(): TenderSource {
         title: findColumn(headerRow, "title"),
         organismo: findColumn(headerRow, "organismo"),
         procedureType: findColumn(headerRow, "procedureType"),
+        category: findColumn(headerRow, "category"),
         status: findColumn(headerRow, "status"),
         publishedAt: findColumn(headerRow, "publishedAt"),
         closingAt: findColumn(headerRow, "closingAt"),
         amount: findColumn(headerRow, "amount"),
+        currency: findColumn(headerRow, "currency"),
         url: findColumn(headerRow, "url"),
       };
 
@@ -187,19 +182,22 @@ export function createBacAnualSource(): TenderSource {
 
         const rawStatus = col.status ? row[col.status]?.trim() : undefined;
         const status = mapStatus(rawStatus);
-        if (rawStatus && status === "publicada") unmappedStatuses.add(rawStatus);
+        if (rawStatus && status === "publicada" && !STATUS_MAP[rawStatus.toLowerCase()]) {
+          unmappedStatuses.add(rawStatus);
+        }
 
         tenders.push({
           externalId,
           title,
           organismo: (col.organismo && row[col.organismo]?.trim()) || "Organismo no informado",
           jurisdiction: DEFAULT_JURISDICTION,
+          category: col.category ? row[col.category]?.trim() : undefined,
           procedureType: col.procedureType ? row[col.procedureType]?.trim() : undefined,
           status,
           publishedAt: parseDate(col.publishedAt ? row[col.publishedAt] : undefined),
           closingAt: parseDate(col.closingAt ? row[col.closingAt] : undefined),
           amount: parseAmount(col.amount ? row[col.amount] : undefined),
-          currency: "ARS",
+          currency: (col.currency && row[col.currency]?.trim()) || "ARS",
           url: col.url ? row[col.url]?.trim() : undefined,
           raw: row,
         });
@@ -207,7 +205,7 @@ export function createBacAnualSource(): TenderSource {
 
       if (unmappedStatuses.size > 0) {
         warnings.push(
-          `Estados sin mapear claro (quedaron como "publicada"), ver STATUS_KEYWORDS en bac-anual.ts: ${Array.from(unmappedStatuses).slice(0, 10).join(" | ")}`,
+          `Estados sin mapear claro (quedaron como "publicada"), ver STATUS_MAP en bac-anual.ts: ${Array.from(unmappedStatuses).slice(0, 10).join(" | ")}`,
         );
       }
 
