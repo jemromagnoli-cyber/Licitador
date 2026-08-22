@@ -6,6 +6,7 @@ import {
   boolean,
   integer,
   bigint,
+  numeric,
   timestamp,
   jsonb,
   pgEnum,
@@ -146,7 +147,11 @@ export const tenders = pgTable(
     publishedAt: timestamp("published_at", { withTimezone: true }),
     closingAt: timestamp("closing_at", { withTimezone: true }),
 
-    amount: bigint("amount", { mode: "number" }),
+    // numeric, no bigint: los montos reales de fuentes como BAC vienen con
+    // centavos (ej. 2026999.98) — bigint solo acepta enteros y esto hacía
+    // fallar el insert con un error de Postgres. precision 18/scale 2 deja
+    // margen amplio para montos grandes (obra pública, etc).
+    amount: numeric("amount", { precision: 18, scale: 2, mode: "number" }),
     currency: varchar("currency", { length: 8 }).default("ARS"),
 
     url: text("url"), // link to the original tender on the source portal
