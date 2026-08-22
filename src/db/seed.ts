@@ -18,12 +18,24 @@ const SOURCES: (typeof sources.$inferInsert)[] = [
   },
   {
     key: "bac-ocds",
-    name: "Buenos Aires Compras (BAC)",
+    name: "Buenos Aires Compras (BAC) — histórico completo OCDS",
     jurisdictionType: "municipal",
     jurisdictionName: "CABA",
     baseUrl: "https://data.buenosaires.gob.ar",
     connectorKey: "bac-ocds",
-    // URL real confirmada (ver bac-ocds.ts) — activa.
+    // Inactiva: probado en producción, son 15 años de historial (desde
+    // 2011) en un solo archivo — mezcla procesos cerrados con vigentes y
+    // tarda varios minutos en descargar/procesar. Reemplazada por
+    // "bac-anual" (ver abajo), acotada al año en curso.
+    active: false,
+  },
+  {
+    key: "bac-anual",
+    name: "Buenos Aires Compras (BAC) — año en curso",
+    jurisdictionType: "municipal",
+    jurisdictionName: "CABA",
+    baseUrl: "https://data.buenosaires.gob.ar",
+    connectorKey: "bac-anual",
     active: true,
   },
   {
