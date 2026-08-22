@@ -45,9 +45,11 @@ export function createBacOcdsSource(): TenderSource {
       try {
         res = await fetch(url, {
           headers: { Accept: "application/json" },
-          // Es un volcado histórico completo, no una respuesta liviana —
-          // damos bastante margen antes de dar por perdido el intento.
-          signal: AbortSignal.timeout(180_000),
+          // Es un volcado histórico completo, no una respuesta liviana. Una
+          // primera prueba en producción con 180s dio timeout, así que
+          // ampliamos bastante el margen — pensado para correr como job de
+          // fondo (cron), no en el path crítico de un deploy.
+          signal: AbortSignal.timeout(900_000),
         });
       } catch (err) {
         const cause = err instanceof Error ? err.message : String(err);
