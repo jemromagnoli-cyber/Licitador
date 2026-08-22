@@ -3,6 +3,7 @@ import { db } from "@/db/client";
 import { ingestRuns, sources, tenders } from "@/db/schema";
 import { buildConnectorRegistry } from "@/lib/connectors/registry";
 import type { NormalizedTender } from "@/lib/connectors/types";
+import { isTenderStillOpen } from "@/lib/tenders/relevance";
 
 export interface IngestSummary {
   sourceKey: string;
@@ -52,9 +53,21 @@ export async function ingestSource(sourceRow: typeof sources.$inferSelect): Prom
 
     let created = 0;
     let updated = 0;
+    let skippedClosed = 0;
 
     for (const t of found) {
-      const wasCreated = await upsertTender(sourceRow.id, t);
+      const existingId = await findExistingTenderId(sourceRow.id, t.externalId);
+
+      // No creamos filas nuevas para procesos que ya sabemos cerrados o
+      // vencidos al momento de la carga (ver relevance.ts) — pero si YA
+      // existía en la base, sí lo actualizamos (para que su estado quede
+      // al día si una empresa lo tenía guardado/en seguimiento).
+      if (!existingId && !isTenderStillOpen(t)) {
+        skippedClosed++;
+        continue;
+      }
+
+      const wasCreated = await upsertTender(sourceRow.id, t, existingId);
       if (wasCreated) created++;
       else updated++;
     }
@@ -63,6 +76,10 @@ export async function ingestSource(sourceRow: typeof sources.$inferSelect): Prom
       .update(sources)
       .set({ lastRunAt: new Date() })
       .where(eq(sources.id, sourceRow.id));
+
+    const allWarnings = skippedClosed > 0
+      ? [...warnings, `${skippedClosed} proceso(s) ya cerrado(s)/vencido(s) omitidos (no se guardaron).`]
+      : warnings;
 
     const status = warnings.length > 0 && found.length === 0 ? "partial" : "success";
 
@@ -74,7 +91,7 @@ export async function ingestSource(sourceRow: typeof sources.$inferSelect): Prom
         itemsFound: found.length,
         itemsCreated: created,
         itemsUpdated: updated,
-        errorMessage: warnings.length ? warnings.join(" | ").slice(0, 2000) : null,
+        errorMessage: allWarnings.length ? allWarnings.join(" | ").slice(0, 2000) : null,
       })
       .where(eq(ingestRuns.id, run!.id));
 
@@ -84,7 +101,7 @@ export async function ingestSource(sourceRow: typeof sources.$inferSelect): Prom
       itemsFound: found.length,
       itemsCreated: created,
       itemsUpdated: updated,
-      warnings,
+      warnings: allWarnings,
     };
   } catch (err) {
     // Drizzle envuelve los errores de query en un mensaje tipo "Failed
@@ -111,14 +128,21 @@ export async function ingestSource(sourceRow: typeof sources.$inferSelect): Prom
   }
 }
 
-/** true si se creó una fila nueva, false si se actualizó una existente. */
-async function upsertTender(sourceId: string, t: NormalizedTender): Promise<boolean> {
+async function findExistingTenderId(sourceId: string, externalId: string): Promise<string | null> {
   const existing = await db.query.tenders.findFirst({
     where: (fields, { and, eq: eqOp }) =>
-      and(eqOp(fields.sourceId, sourceId), eqOp(fields.externalId, t.externalId)),
+      and(eqOp(fields.sourceId, sourceId), eqOp(fields.externalId, externalId)),
     columns: { id: true },
   });
+  return existing?.id ?? null;
+}
 
+/** true si se creó una fila nueva, false si se actualizó una existente. */
+async function upsertTender(
+  sourceId: string,
+  t: NormalizedTender,
+  existingId: string | null,
+): Promise<boolean> {
   const values = {
     sourceId,
     externalId: t.externalId,
@@ -137,8 +161,8 @@ async function upsertTender(sourceId: string, t: NormalizedTender): Promise<bool
     updatedAt: new Date(),
   };
 
-  if (existing) {
-    await db.update(tenders).set(values).where(eq(tenders.id, existing.id));
+  if (existingId) {
+    await db.update(tenders).set(values).where(eq(tenders.id, existingId));
     return false;
   }
 
