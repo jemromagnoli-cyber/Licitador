@@ -2,6 +2,7 @@ import type { TenderSource } from "./types";
 import { createDemoSource } from "./demo";
 import { createBacOcdsSource } from "./bac-ocds";
 import { createBacAnualSource } from "./bac-anual";
+import { createBacAperturaSource } from "./bac-apertura";
 import { createContratarCkanSource } from "./contratar-ckan";
 
 /**
@@ -9,15 +10,16 @@ import { createContratarCkanSource } from "./contratar-ckan";
  * archivo que exporte un TenderSource y agregarlo acá + una fila en la
  * tabla `sources` (ver src/db/seed.ts) con el mismo `connectorKey`.
  *
- * bac-ocds sigue registrado (el parser OCDS es reutilizable para otras
- * jurisdicciones que publiquen bajo ese estándar) pero la fuente "bac-ocds"
- * está inactiva en el seed — ver bac-anual.ts para el porqué.
+ * bac-ocds y bac-anual siguen registrados (por si sirven de base para otra
+ * fuente más adelante) pero están inactivos en el seed — la fuente activa
+ * para BAC es "bac-apertura" (ver bac-apertura.ts para el porqué).
  */
 export function buildConnectorRegistry(): Map<string, TenderSource> {
   const sources = [
     createDemoSource(),
     createBacOcdsSource(),
     createBacAnualSource(),
+    createBacAperturaSource(),
     createContratarCkanSource(),
   ];
   return new Map(sources.map((s) => [s.key, s]));
