@@ -36,6 +36,20 @@ const SOURCES: (typeof sources.$inferInsert)[] = [
     jurisdictionName: "CABA",
     baseUrl: "https://data.buenosaires.gob.ar",
     connectorKey: "bac-anual",
+    // Inactiva: probado en producción, el recurso "Anual" resultó ser un
+    // archivo histórico que se actualiza con poca frecuencia — el 100% de
+    // los procesos que trajo ya tenían fecha de cierre vencida, incluso
+    // marcados como activos. Reemplazada por "bac-apertura", que lee
+    // directamente el buscador "En Apertura" del propio portal BAC.
+    active: false,
+  },
+  {
+    key: "bac-apertura",
+    name: "Buenos Aires Compras (BAC) — procesos en apertura",
+    jurisdictionType: "municipal",
+    jurisdictionName: "CABA",
+    baseUrl: "https://www.buenosairescompras.gob.ar",
+    connectorKey: "bac-apertura",
     active: true,
   },
   {
