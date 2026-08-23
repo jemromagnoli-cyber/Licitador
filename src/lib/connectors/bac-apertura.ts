@@ -82,7 +82,13 @@ const COMMON_HEADERS: Record<string, string> = {
     "Mozilla/5.0 (compatible; LicitadorBot/1.0; +https://licitador-production-d3a3.up.railway.app)",
   Referer: BASE_URL,
   Origin: "https://www.buenosairescompras.gob.ar",
+  // Sin esto algunos servidores igual comprimen la respuesta (gzip/br) y,
+  // como acá no la estamos descomprimiendo (no usamos fetch), terminaría
+  // llegando como bytes binarios en vez de HTML.
+  "Accept-Encoding": "identity",
 };
+
+const MAX_REDIRECTS = 5;
 
 interface BacRow {
   numeroProceso: string;
@@ -209,18 +215,11 @@ function cookieHeader(jar: Map<string, string>): string {
  * (pensado exactamente para este tipo de servidor no del todo compliant),
  * así que para este conector se usa ese en vez de `fetch`.
  */
-async function fetchWithCookies(
+function rawRequest(
   url: string,
-  init: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
-  jar: Map<string, string>,
-): Promise<{ html: string; status: number }> {
-  const headers: Record<string, string> = { ...COMMON_HEADERS, ...init.headers };
-  const cookieStr = cookieHeader(jar);
-  if (cookieStr) headers.Cookie = cookieStr;
-  if (init.body) headers["Content-Length"] = String(Buffer.byteLength(init.body));
-
+  init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string },
+): Promise<{ html: string; status: number; headers: Record<string, string | string[] | undefined> }> {
   const parsedUrl = new URL(url);
-
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
@@ -228,7 +227,7 @@ async function fetchWithCookies(
         port: 443,
         path: `${parsedUrl.pathname}${parsedUrl.search}`,
         method: init.method,
-        headers,
+        headers: init.headers,
         insecureHTTPParser: true,
         timeout: REQUEST_TIMEOUT_MS,
       },
@@ -236,9 +235,11 @@ async function fetchWithCookies(
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("end", () => {
-          const setCookie = res.headers["set-cookie"];
-          if (setCookie) mergeCookies(jar, setCookie);
-          resolve({ html: Buffer.concat(chunks).toString("utf-8"), status: res.statusCode ?? 0 });
+          resolve({
+            html: Buffer.concat(chunks).toString("utf-8"),
+            status: res.statusCode ?? 0,
+            headers: res.headers as Record<string, string | string[] | undefined>,
+          });
         });
         res.on("error", reject);
       },
@@ -248,6 +249,39 @@ async function fetchWithCookies(
     if (init.body) req.write(init.body);
     req.end();
   });
+}
+
+/**
+ * A diferencia de `fetch`, `https.request` no sigue redirects (3xx) solo —
+ * hay que leer el header `Location` y volver a pedir a mano. BAC puede
+ * mandar un redirect en la primera visita (ej: a una versión con "www." o
+ * a establecer sesión) antes de servir la página real.
+ */
+async function fetchWithCookies(
+  url: string,
+  init: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
+  jar: Map<string, string>,
+): Promise<{ html: string; status: number }> {
+  let currentUrl = url;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
+    const headers: Record<string, string> = { ...COMMON_HEADERS, ...init.headers };
+    const cookieStr = cookieHeader(jar);
+    if (cookieStr) headers.Cookie = cookieStr;
+    if (init.body) headers["Content-Length"] = String(Buffer.byteLength(init.body));
+
+    const res = await rawRequest(currentUrl, { method: init.method, headers, body: init.body });
+    const setCookie = res.headers["set-cookie"];
+    if (setCookie) mergeCookies(jar, Array.isArray(setCookie) ? setCookie : [setCookie]);
+
+    if (res.status >= 300 && res.status < 400 && res.headers.location) {
+      const location = Array.isArray(res.headers.location) ? res.headers.location[0] : res.headers.location;
+      currentUrl = new URL(location!, currentUrl).toString();
+      continue;
+    }
+
+    return { html: res.html, status: res.status };
+  }
+  throw new Error(`Demasiados redirects (>${MAX_REDIRECTS}) siguiendo ${url}`);
 }
 
 /**
@@ -295,9 +329,11 @@ export function createBacAperturaSource(): TenderSource {
       const jar = new Map<string, string>();
 
       let initialHtml: string;
+      let initialStatus: number;
       try {
         const initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
         initialHtml = initial.html;
+        initialStatus = initial.status;
       } catch (err) {
         const cause = describeFetchError(err);
         throw new Error(`No se pudo abrir la búsqueda avanzada de BAC (${BASE_URL}): ${cause}`);
@@ -305,8 +341,14 @@ export function createBacAperturaSource(): TenderSource {
 
       let hidden = extractHiddenFields(initialHtml);
       if (!hidden.__VIEWSTATE) {
+        // Diagnóstico: si esto vuelve a fallar, el mensaje ya trae el
+        // status HTTP y una muestra del body para no tener que iterar a
+        // ciegas otra vez (ver historial: ya pasamos por "fetch failed"
+        // por un header no compliant, y podría ser otra sorpresa distinta
+        // la próxima vez — un WAF, una página de challenge, etc).
+        const snippet = initialHtml.replace(/\s+/g, " ").trim().slice(0, 300);
         throw new Error(
-          "No se pudo leer __VIEWSTATE de la página de búsqueda de BAC — el formulario pudo haber cambiado, revisar bac-apertura.ts.",
+          `No se pudo leer __VIEWSTATE de la página de búsqueda de BAC (status HTTP ${initialStatus}, body de ${initialHtml.length} chars). Primeros 300 chars: "${snippet}"`,
         );
       }
 
