@@ -1,3 +1,4 @@
+import https from "node:https";
 import type { NormalizedTender, TenderSource, TenderSourceResult } from "./types";
 
 /**
@@ -181,15 +182,6 @@ function rowToTender(row: BacRow): NormalizedTender {
   };
 }
 
-function extractCookies(res: Response): string[] {
-  const headersWithGetSetCookie = res.headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof headersWithGetSetCookie.getSetCookie === "function") {
-    return headersWithGetSetCookie.getSetCookie();
-  }
-  const single = res.headers.get("set-cookie");
-  return single ? [single] : [];
-}
-
 function mergeCookies(jar: Map<string, string>, setCookieHeaders: string[]): void {
   for (const header of setCookieHeaders) {
     const pair = header.split(";")[0] ?? "";
@@ -207,20 +199,55 @@ function cookieHeader(jar: Map<string, string>): string {
     .join("; ");
 }
 
+/**
+ * BAC corre en un servidor (IIS/ASP.NET viejo) que manda alguna respuesta
+ * con un header que no cumple estrictamente RFC 7230 — probado en
+ * producción, el `fetch` global de Node (undici, parser estricto) la
+ * rechaza directo con "Response does not match the HTTP/1.1 protocol
+ * (Invalid header value char)", sin llegar siquiera a leer el body. El
+ * módulo `https` nativo de Node acepta `insecureHTTPParser: true`
+ * (pensado exactamente para este tipo de servidor no del todo compliant),
+ * así que para este conector se usa ese en vez de `fetch`.
+ */
 async function fetchWithCookies(
   url: string,
-  init: RequestInit,
+  init: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
   jar: Map<string, string>,
 ): Promise<{ html: string; status: number }> {
-  const headers = new Headers(init.headers);
+  const headers: Record<string, string> = { ...COMMON_HEADERS, ...init.headers };
   const cookieStr = cookieHeader(jar);
-  if (cookieStr) headers.set("Cookie", cookieStr);
-  for (const [k, v] of Object.entries(COMMON_HEADERS)) headers.set(k, v);
+  if (cookieStr) headers.Cookie = cookieStr;
+  if (init.body) headers["Content-Length"] = String(Buffer.byteLength(init.body));
 
-  const res = await fetch(url, { ...init, headers, redirect: "follow", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-  mergeCookies(jar, extractCookies(res));
-  const html = await res.text();
-  return { html, status: res.status };
+  const parsedUrl = new URL(url);
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: parsedUrl.hostname,
+        port: 443,
+        path: `${parsedUrl.pathname}${parsedUrl.search}`,
+        method: init.method,
+        headers,
+        insecureHTTPParser: true,
+        timeout: REQUEST_TIMEOUT_MS,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const setCookie = res.headers["set-cookie"];
+          if (setCookie) mergeCookies(jar, setCookie);
+          resolve({ html: Buffer.concat(chunks).toString("utf-8"), status: res.statusCode ?? 0 });
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error(`Timeout de ${REQUEST_TIMEOUT_MS}ms esperando respuesta de BAC`)));
+    req.on("error", reject);
+    if (init.body) req.write(init.body);
+    req.end();
+  });
 }
 
 /**
