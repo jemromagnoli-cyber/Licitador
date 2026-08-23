@@ -223,6 +223,30 @@ async function fetchWithCookies(
   return { html, status: res.status };
 }
 
+/**
+ * Node/undici envuelve el error real de fetch en un mensaje genérico
+ * "fetch failed" — la causa de verdad (DNS, TLS, conexión rechazada, etc)
+ * está en `err.cause`, a veces anidada más de un nivel. La vimos aparecer
+ * así en producción con el primer intento de este conector, sin dar
+ * ninguna pista útil — por eso este helper camina la cadena de causas.
+ */
+function describeFetchError(err: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = err;
+  let depth = 0;
+  while (current && depth < 5) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      current = (current as Error & { cause?: unknown }).cause;
+    } else {
+      parts.push(String(current));
+      current = undefined;
+    }
+    depth++;
+  }
+  return parts.join(" | causa: ");
+}
+
 function buildBody(hiddenFields: Record<string, string>, eventTarget: string, eventArgument: string): string {
   const merged: Record<string, string> = {
     ...hiddenFields,
@@ -248,7 +272,7 @@ export function createBacAperturaSource(): TenderSource {
         const initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
         initialHtml = initial.html;
       } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err);
+        const cause = describeFetchError(err);
         throw new Error(`No se pudo abrir la búsqueda avanzada de BAC (${BASE_URL}): ${cause}`);
       }
 
@@ -269,7 +293,7 @@ export function createBacAperturaSource(): TenderSource {
         );
         firstResultsHtml = first.html;
       } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err);
+        const cause = describeFetchError(err);
         throw new Error(`Falló la búsqueda "Estado proceso = En Apertura" en BAC: ${cause}`);
       }
 
@@ -300,7 +324,7 @@ export function createBacAperturaSource(): TenderSource {
           );
           pageHtml = pageRes.html;
         } catch (err) {
-          const cause = err instanceof Error ? err.message : String(err);
+          const cause = describeFetchError(err);
           warnings.push(`Se cortó la paginación en la página ${page}/${totalPages}: ${cause}`);
           break;
         }
