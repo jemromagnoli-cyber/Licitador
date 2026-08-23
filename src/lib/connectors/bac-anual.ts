@@ -28,6 +28,14 @@ import type { NormalizedTender, TenderSource, TenderSourceResult, TenderStatus }
  * "tender/procuringEntity/name" en vez de JSON anidado. Los nombres de
  * columna de abajo están confirmados contra un resultado real de
  * producción (ver ingest_runs), no son una estimación.
+ *
+ * INACTIVA (ver src/db/seed.ts): probado en producción, este recurso
+ * resultó ser un archivo histórico que se actualiza con poca frecuencia —
+ * el 100% de los ~25.000 procesos que trajo ya tenían fecha de cierre
+ * vencida, incluso los marcados como estado "activo". Reemplazada por
+ * bac-apertura.ts, que lee directamente el buscador "En Apertura" del
+ * propio portal BAC (la misma fuente que usa cualquier persona en el sitio
+ * para ver qué está publicado ahora).
  */
 
 const CSV_URL =
@@ -208,38 +216,6 @@ export function createBacAnualSource(): TenderSource {
           `Estados sin mapear claro (quedaron como "publicada"), ver STATUS_MAP en bac-anual.ts: ${Array.from(unmappedStatuses).slice(0, 10).join(" | ")}`,
         );
       }
-
-      // --- DIAGNÓSTICO TEMPORAL --------------------------------------
-      // Un run real en producción marcó el 100% de 24.911 procesos como
-      // "ya cerrado/vencido" (0 creados, 0 actualizados). Es sospechoso
-      // que sea exactamente el 100% — antes de confundir "no hay
-      // licitaciones abiertas hoy" con "estamos leyendo mal el estado o
-      // la fecha", volcamos acá qué está encontrando realmente el
-      // parser. Sacar este bloque una vez confirmado el diagnóstico.
-      const now = new Date();
-      const statusCounts = new Map<TenderStatus, number>();
-      let closingFuture = 0;
-      let closingPast = 0;
-      let closingMissing = 0;
-      const samples: string[] = [];
-      for (const t of tenders) {
-        statusCounts.set(t.status, (statusCounts.get(t.status) ?? 0) + 1);
-        if (!t.closingAt) closingMissing++;
-        else if (t.closingAt.getTime() < now.getTime()) closingPast++;
-        else closingFuture++;
-        if (samples.length < 5) {
-          samples.push(
-            `[${t.externalId}] status=${t.status} closingAt=${t.closingAt ? t.closingAt.toISOString() : "—"} closingAtRaw="${col.closingAt ? t.raw && (t.raw as Record<string, string>)[col.closingAt] : "—"}"`,
-          );
-        }
-      }
-      const statusSummary = Array.from(statusCounts.entries())
-        .map(([s, c]) => `${s}=${c}`)
-        .join(", ");
-      warnings.push(
-        `DIAGNÓSTICO status: ${statusSummary} | closingAt: futuras=${closingFuture} pasadas=${closingPast} sin_dato=${closingMissing} | columna closingAt usada="${col.closingAt ?? "NINGUNA"}" | columna status usada="${col.status ?? "NINGUNA"}" | muestras: ${samples.join("  ||  ")}`,
-      );
-      // --- FIN DIAGNÓSTICO TEMPORAL ------------------------------------
 
       return { tenders, warnings };
     },
