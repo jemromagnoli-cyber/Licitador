@@ -1,4 +1,4 @@
-import https from "node:https";
+import { chromium } from "playwright";
 import type { NormalizedTender, TenderSource, TenderSourceResult } from "./types";
 
 /**
@@ -18,19 +18,24 @@ import type { NormalizedTender, TenderSource, TenderSourceResult } from "./types
  * publicado ahora, así que es la fuente correcta para "solo lo que está
  * abierto ahora mismo".
  *
- * CÓMO FUNCIONA (sin necesitar un navegador automatizado):
- * BuscarAvanzado.aspx es un formulario clásico de ASP.NET WebForms
- * (postback), no tiene una API en JSON. Pero se puede reproducir con
- * fetch normal:
- *   1. GET a la página para conseguir cookies de sesión + los campos
- *      ocultos que ASP.NET necesita (__VIEWSTATE, __VIEWSTATEGENERATOR,
- *      el token CSRF, etc).
- *   2. POST simulando "seleccionar Estado proceso = En Apertura" + click
- *      en "Buscar" (__EVENTTARGET = btnListarPliegoAvanzado).
- *   3. Los resultados vienen paginados de a 10. Para cada página siguiente
- *      se hace otro POST con __EVENTTARGET = GridListaPliegos y
- *      __EVENTARGUMENT = "Page$N", reusando el __VIEWSTATE más reciente
- *      (cada respuesta trae uno nuevo).
+ * POR QUÉ ESTE CONECTOR USA UN NAVEGADOR (Playwright) EN VEZ DE fetch/https:
+ * La primera versión reproducía el formulario de ASP.NET WebForms a mano
+ * (GET para conseguir cookies + __VIEWSTATE, POST simulando el click en
+ * "Buscar", POST paginado con __doPostBack). Probado en producción: el GET
+ * siempre funcionaba, pero el POST de búsqueda volvía redirigido (302) a
+ * Default.aspx — es decir, 0 resultados — incluso reproduciendo exactamente
+ * los mismos campos del formulario, las mismas cookies de sesión y headers
+ * de navegador real (User-Agent de Chrome, Sec-Fetch-*, sec-ch-ua). Se
+ * confirmó a mano con un navegador real (Claude in Chrome) que ese mismo
+ * POST, desde una sesión de navegador real, SÍ funciona y devuelve
+ * resultados (712 procesos "En Apertura" al momento de probarlo) — así que
+ * no es que "todo POST esté bloqueado", sino algo específico de cómo se ve
+ * la conexión (posiblemente el fingerprint TLS/HTTP2 de Node, o reputación
+ * de la IP del datacenter para pedidos que "mutan" vs. los de solo lectura)
+ * que un simple cambio de headers no alcanza a resolver. Por eso este
+ * conector usa Playwright para manejar un Chromium real sin interfaz
+ * (headless): abre la página, completa el filtro "Estado proceso = En
+ * Apertura" y hace click en "Buscar" tal como lo haría una persona.
  *
  * IMPORTANTE sobre "Fecha de apertura": empíricamente se observó que BAC
  * a veces deja procesos marcados "En Apertura" con una fecha de apertura
@@ -50,71 +55,13 @@ const BASE_URL = "https://www.buenosairescompras.gob.ar/BuscarAvanzado.aspx";
 const DEFAULT_JURISDICTION = "CABA";
 const PAGE_SIZE = 10;
 const ESTADO_EN_APERTURA = "13";
-const REQUEST_TIMEOUT_MS = 30_000;
+const NAV_TIMEOUT_MS = 30_000;
 // Salvaguarda: si algo sale mal y la paginación no corta, no seguir para
 // siempre. 400 páginas = 4000 procesos, muy por encima de lo esperado.
 const MAX_PAGES = 400;
 
-// Campos visibles del formulario (no ocultos) que controlamos nosotros.
-// El resto de los campos (los ocultos: __VIEWSTATE, __VIEWSTATEGENERATOR,
-// el token CSRF, y varios más específicos de los controles DevExpress del
-// portal) se toman tal cual vienen en cada respuesta — ver extractHiddenFields.
-const VISIBLE_FIELD_DEFAULTS: Record<string, string> = {
-  "ctl00$CPH1$txtNumeroProceso": "",
-  "ctl00$CPH1$txtExpediente": "",
-  "ctl00$CPH1$txtNombrePliego": "",
-  "ctl00$CPH1$ddlJurisdicion": "-2",
-  "ctl00$CPH1$ddlUnidadEjecutora": "-2",
-  "ctl00$CPH1$ddlTipoProceso": "-2",
-  "ctl00$CPH1$ddlEstadoProceso": ESTADO_EN_APERTURA,
-  "ctl00$CPH1$ddlRubro": "-2",
-  "ctl00$CPH1$devCbPnlNombreProveedor$txtNombreProveedor": "",
-  "ctl00$CPH1$txtFechaDesde": "",
-  "ctl00$CPH1$txtFechaHasta": "",
-  "ctl00$CPH1$ddlResultadoOrdenadoPor": "PLI.Pliego.NumeroPliego",
-  "ctl00$CPH1$hidEstadoListaPliegos": "NOREPORTEEXCEL",
-  "ctl00$CPH1$devCbPnlPopupListarProveedor$txtPopupNombreProveedor": "",
-  "ctl00$CPH1$devCbPnlPopupListarProveedor$txtPopupCuitProveedor": "",
-};
-
-// Probado a mano en el navegador (Claude in Chrome): con las cookies de
-// sesión correctas, un POST real de "Buscar" a esta misma URL devuelve 200
-// con resultados (se vieron 712 procesos "En Apertura"), no un redirect. Es
-// decir, el 302 a Default.aspx que veíamos en producción no es "todo POST
-// se bloquea" — es más específico. El sospechoso principal: nuestro
-// User-Agent anterior ("LicitadorBot/1.0...") es un patrón clásico de bot
-// (contiene "compatible;" + "+http", como los crawlers de buscadores). Es
-// común que un WAF (acá, F5 BIG-IP) sea permisivo con bots conocidos en GET
-// (para no romper la indexación) pero bloquee/redirija sus POST (que son
-// "mutación"/acción, no solo lectura). Por eso ahora estos headers imitan
-// una navegación real de Chrome de escritorio (mismo User-Agent y headers
-// Sec-Fetch-*/sec-ch-ua que capturamos del navegador real) en vez de
-// identificarse como bot — los datos que se piden son públicos (el mismo
-// buscador de licitaciones que ve cualquier persona en el sitio de BAC).
-const COMMON_HEADERS: Record<string, string> = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
-  "Cache-Control": "max-age=0",
-  "Upgrade-Insecure-Requests": "1",
-  "sec-ch-ua": '"Not_A Brand";v="24", "Chromium";v="151", "Google Chrome";v="151"',
-  "sec-ch-ua-mobile": "?0",
-  "sec-ch-ua-platform": '"Windows"',
-  "Sec-Fetch-Site": "same-origin",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-User": "?1",
-  "Sec-Fetch-Dest": "document",
-  Referer: BASE_URL,
-  Origin: "https://www.buenosairescompras.gob.ar",
-  // Sin esto algunos servidores igual comprimen la respuesta (gzip/br) y,
-  // como acá no la estamos descomprimiendo (no usamos fetch), terminaría
-  // llegando como bytes binarios en vez de HTML.
-  "Accept-Encoding": "identity",
-};
-
-const MAX_REDIRECTS = 5;
+const SEL_ESTADO_PROCESO = "#ctl00_CPH1_ddlEstadoProceso";
+const SEL_BOTON_BUSCAR = "#ctl00_CPH1_btnListarPliegoAvanzado";
 
 interface BacRow {
   numeroProceso: string;
@@ -140,37 +87,6 @@ function cleanCell(html: string): string {
   return decodeEntities(html.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
-}
-
-/** Extrae todos los <input type="hidden" ...> de la página (VIEWSTATE, token CSRF, etc). */
-function extractHiddenFields(html: string): Record<string, string> {
-  const fields: Record<string, string> = {};
-  const inputTags = html.match(/<input\b[^>]*>/gi) ?? [];
-  for (const tag of inputTags) {
-    const typeMatch = tag.match(/type\s*=\s*"([^"]*)"/i);
-    if (!typeMatch || typeMatch[1].toLowerCase() !== "hidden") continue;
-    const nameMatch = tag.match(/name\s*=\s*"([^"]*)"/i);
-    if (!nameMatch) continue;
-    const valueMatch = tag.match(/value\s*=\s*"([^"]*)"/i);
-    fields[nameMatch[1]] = valueMatch ? decodeEntities(valueMatch[1]) : "";
-  }
-  return fields;
-}
-
-/** Lee qué opción quedó seleccionada en un <select id="..."> de la respuesta. */
-function extractSelectedOption(html: string, elementId: string): string | undefined {
-  const selectRegex = new RegExp(`<select[^>]*id\\s*=\\s*"${elementId}"[^>]*>([\\s\\S]*?)</select>`, "i");
-  const selectMatch = html.match(selectRegex);
-  if (!selectMatch) return undefined;
-  const optionRegex = /<option\b([^>]*)>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = optionRegex.exec(selectMatch[1])) !== null) {
-    if (/selected/i.test(m[1])) {
-      const valueMatch = m[1].match(/value\s*=\s*"([^"]*)"/i);
-      return valueMatch ? valueMatch[1] : "";
-    }
-  }
-  return undefined;
 }
 
 function extractTotalCount(html: string): number {
@@ -230,138 +146,16 @@ function rowToTender(row: BacRow): NormalizedTender {
   };
 }
 
-function mergeCookies(jar: Map<string, string>, setCookieHeaders: string[]): void {
-  for (const header of setCookieHeaders) {
-    const pair = header.split(";")[0] ?? "";
-    const eqIdx = pair.indexOf("=");
-    if (eqIdx === -1) continue;
-    const name = pair.slice(0, eqIdx).trim();
-    const value = pair.slice(eqIdx + 1).trim();
-    if (name) jar.set(name, value);
-  }
-}
-
-function cookieHeader(jar: Map<string, string>): string {
-  return Array.from(jar.entries())
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
-
 /**
- * BAC corre en un servidor (IIS/ASP.NET viejo) que manda alguna respuesta
- * con un header que no cumple estrictamente RFC 7230 — probado en
- * producción, el `fetch` global de Node (undici, parser estricto) la
- * rechaza directo con "Response does not match the HTTP/1.1 protocol
- * (Invalid header value char)", sin llegar siquiera a leer el body. El
- * módulo `https` nativo de Node acepta `insecureHTTPParser: true`
- * (pensado exactamente para este tipo de servidor no del todo compliant),
- * así que para este conector se usa ese en vez de `fetch`.
+ * Espera "lo mejor que se puede" a que termine una navegación/postback de
+ * ASP.NET: no sabemos de antemano si el click dispara una navegación de
+ * página completa o una actualización parcial (AJAX), así que probamos
+ * networkidle con timeout corto (no aborta el flujo si no llega a estar
+ * idle) más una espera fija chica, para cubrir ambos casos.
  */
-function rawRequest(
-  url: string,
-  init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string },
-): Promise<{ html: string; status: number; headers: Record<string, string | string[] | undefined> }> {
-  const parsedUrl = new URL(url);
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        hostname: parsedUrl.hostname,
-        port: 443,
-        path: `${parsedUrl.pathname}${parsedUrl.search}`,
-        method: init.method,
-        headers: init.headers,
-        insecureHTTPParser: true,
-        timeout: REQUEST_TIMEOUT_MS,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
-        res.on("end", () => {
-          resolve({
-            html: Buffer.concat(chunks).toString("utf-8"),
-            status: res.statusCode ?? 0,
-            headers: res.headers as Record<string, string | string[] | undefined>,
-          });
-        });
-        res.on("error", reject);
-      },
-    );
-    req.on("timeout", () => req.destroy(new Error(`Timeout de ${REQUEST_TIMEOUT_MS}ms esperando respuesta de BAC`)));
-    req.on("error", reject);
-    if (init.body) req.write(init.body);
-    req.end();
-  });
-}
-
-/**
- * A diferencia de `fetch`, `https.request` no sigue redirects (3xx) solo —
- * hay que leer el header `Location` y volver a pedir a mano. BAC puede
- * mandar un redirect en la primera visita (ej: a una versión con "www." o
- * a establecer sesión) antes de servir la página real.
- */
-async function fetchWithCookies(
-  url: string,
-  init: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
-  jar: Map<string, string>,
-): Promise<{ html: string; status: number; redirects: { status: number; location: string }[]; finalUrl: string }> {
-  let currentUrl = url;
-  const redirects: { status: number; location: string }[] = [];
-  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
-    const headers: Record<string, string> = { ...COMMON_HEADERS, ...init.headers };
-    const cookieStr = cookieHeader(jar);
-    if (cookieStr) headers.Cookie = cookieStr;
-    if (init.body) headers["Content-Length"] = String(Buffer.byteLength(init.body));
-
-    const res = await rawRequest(currentUrl, { method: init.method, headers, body: init.body });
-    const setCookie = res.headers["set-cookie"];
-    if (setCookie) mergeCookies(jar, Array.isArray(setCookie) ? setCookie : [setCookie]);
-
-    if (res.status >= 300 && res.status < 400 && res.headers.location) {
-      const location = Array.isArray(res.headers.location) ? res.headers.location[0] : res.headers.location;
-      redirects.push({ status: res.status, location: location! });
-      currentUrl = new URL(location!, currentUrl).toString();
-      continue;
-    }
-
-    return { html: res.html, status: res.status, redirects, finalUrl: currentUrl };
-  }
-  throw new Error(`Demasiados redirects (>${MAX_REDIRECTS}) siguiendo ${url}`);
-}
-
-/**
- * Node/undici envuelve el error real de fetch en un mensaje genérico
- * "fetch failed" — la causa de verdad (DNS, TLS, conexión rechazada, etc)
- * está en `err.cause`, a veces anidada más de un nivel. La vimos aparecer
- * así en producción con el primer intento de este conector, sin dar
- * ninguna pista útil — por eso este helper camina la cadena de causas.
- */
-function describeFetchError(err: unknown): string {
-  const parts: string[] = [];
-  let current: unknown = err;
-  let depth = 0;
-  while (current && depth < 5) {
-    if (current instanceof Error) {
-      parts.push(current.message);
-      current = (current as Error & { cause?: unknown }).cause;
-    } else {
-      parts.push(String(current));
-      current = undefined;
-    }
-    depth++;
-  }
-  return parts.join(" | causa: ");
-}
-
-function buildBody(hiddenFields: Record<string, string>, eventTarget: string, eventArgument: string): string {
-  const merged: Record<string, string> = {
-    ...hiddenFields,
-    ...VISIBLE_FIELD_DEFAULTS,
-    __EVENTTARGET: eventTarget,
-    __EVENTARGUMENT: eventArgument,
-  };
-  const params = new URLSearchParams();
-  for (const [k, v] of Object.entries(merged)) params.set(k, v);
-  return params.toString();
+async function esperarPostback(page: import("playwright").Page): Promise<void> {
+  await page.waitForLoadState("networkidle", { timeout: NAV_TIMEOUT_MS }).catch(() => {});
+  await page.waitForTimeout(500);
 }
 
 export function createBacAperturaSource(): TenderSource {
@@ -370,153 +164,118 @@ export function createBacAperturaSource(): TenderSource {
     label: "Buenos Aires Compras (BAC) — procesos en apertura (vigentes)",
     async fetchTenders(): Promise<TenderSourceResult> {
       const warnings: string[] = [];
-      const jar = new Map<string, string>();
 
-      let initialHtml: string;
-      let initialStatus: number;
+      const browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      });
+
       try {
-        let initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
-        // Confirmado con el navegador real: la PRIMERA visita "en frío" (sin
-        // cookies previas de este dominio) a BuscarAvanzado.aspx devuelve un
-        // redirect 302 a Default.aspx — parece un bootstrap de sesión del
-        // WAF/balanceador (F5 BIG-IP). fetchWithCookies sigue ese redirect y
-        // termina trayendo el HTML de Default.aspx (que también es ASP.NET y
-        // tiene su propio __VIEWSTATE, por eso no fallaba con "no se pudo
-        // leer __VIEWSTATE" — el problema es que era el VIEWSTATE de otra
-        // página). Repitiendo el mismo GET una segunda vez, ya con las
-        // cookies que quedaron en el jar tras ese primer redirect, el
-        // servidor sí devuelve la página de búsqueda real directamente
-        // (200, sin redirect) — se probó a mano en el navegador y se
-        // reproduce igual. Si el HTML no tiene el campo ddlEstadoProceso es
-        // señal de que no estamos en la página correcta, así que
-        // reintentamos una vez más antes de seguir.
-        if (!initial.html.includes("ddlEstadoProceso")) {
-          warnings.push(
-            `Primer GET a BAC no devolvió la página de búsqueda (aterrizó en ${initial.finalUrl}, status ${initial.status}) — reintentando una vez con las cookies de sesión ya obtenidas.`,
-          );
-          initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
-        }
-        initialHtml = initial.html;
-        initialStatus = initial.status;
-      } catch (err) {
-        const cause = describeFetchError(err);
-        throw new Error(`No se pudo abrir la búsqueda avanzada de BAC (${BASE_URL}): ${cause}`);
-      }
+        const page = await browser.newPage({
+          userAgent:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+          locale: "es-AR",
+        });
+        page.setDefaultTimeout(NAV_TIMEOUT_MS);
+        page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
 
-      let hidden = extractHiddenFields(initialHtml);
-      if (!hidden.__VIEWSTATE) {
-        // Diagnóstico: si esto vuelve a fallar, el mensaje ya trae el
-        // status HTTP y una muestra del body para no tener que iterar a
-        // ciegas otra vez (ver historial: ya pasamos por "fetch failed"
-        // por un header no compliant, y podría ser otra sorpresa distinta
-        // la próxima vez — un WAF, una página de challenge, etc).
-        const snippet = initialHtml.replace(/\s+/g, " ").trim().slice(0, 300);
-        throw new Error(
-          `No se pudo leer __VIEWSTATE de la página de búsqueda de BAC (status HTTP ${initialStatus}, body de ${initialHtml.length} chars). Primeros 300 chars: "${snippet}"`,
-        );
-      }
-
-      let firstResultsHtml: string;
-      let firstResultsStatus: number;
-      let firstResultsRedirects: { status: number; location: string }[];
-      let firstResultsFinalUrl: string;
-      try {
-        const body = buildBody(hidden, "ctl00$CPH1$btnListarPliegoAvanzado", "");
-        const first = await fetchWithCookies(
-          BASE_URL,
-          { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
-          jar,
-        );
-        firstResultsHtml = first.html;
-        firstResultsStatus = first.status;
-        firstResultsRedirects = first.redirects;
-        firstResultsFinalUrl = first.finalUrl;
-      } catch (err) {
-        const cause = describeFetchError(err);
-        throw new Error(`Falló la búsqueda "Estado proceso = En Apertura" en BAC: ${cause}`);
-      }
-
-      const totalCount = extractTotalCount(firstResultsHtml);
-      const firstPageRows = extractDataRows(firstResultsHtml);
-
-      if (totalCount === 0 && firstPageRows.length === 0) {
-        // Diagnóstico (ver el de __VIEWSTATE más arriba, misma idea): si
-        // esto vuelve a pasar, con esto alcanza para saber por qué sin
-        // tener que iterar a ciegas otra vez. En particular: si el
-        // servidor "recuerda" que mandamos ddlEstadoProceso=13 (el select
-        // debería volver con ese valor marcado como selected) es señal de
-        // que sí procesó nuestro POST — si vuelve en -2 ("Seleccionar"),
-        // el servidor no está atando nuestro body a la sesión/postback.
-        const hasGrid = firstResultsHtml.includes("GridListaPliegos");
-        const hasEncontrado = firstResultsHtml.includes("encontrado");
-        const hasDdlEstado = firstResultsHtml.includes("ddlEstadoProceso");
-        const hasBusquedaAvanzada = firstResultsHtml.includes("Búsqueda Avanzada") || firstResultsHtml.includes("squeda Avanzada");
-        const echoedEstado = extractSelectedOption(firstResultsHtml, "ctl00_CPH1_ddlEstadoProceso");
-        const cookieNames = Array.from(jar.keys()).join(", ") || "(ninguna)";
-        // El arranque del HTML (doctype/head) es igual en cualquier página
-        // del sitio y no sirve para diferenciar qué página nos devolvió —
-        // en vez de eso, recortamos alrededor de donde debería estar el
-        // campo del formulario, si es que aparece en algún lado.
-        const anchorIdx = firstResultsHtml.indexOf("ddlEstadoProceso");
-        const snippet =
-          anchorIdx === -1
-            ? firstResultsHtml.replace(/\s+/g, " ").trim().slice(0, 400)
-            : firstResultsHtml
-                .slice(Math.max(0, anchorIdx - 200), anchorIdx + 200)
-                .replace(/\s+/g, " ")
-                .trim();
-        const redirectsDesc =
-          firstResultsRedirects.length === 0
-            ? "ninguno"
-            : firstResultsRedirects.map((r) => `${r.status} → ${r.location}`).join(" ; ");
-        return {
-          tenders: [],
-          warnings: [
-            `BAC devolvió 0 procesos "En Apertura" — status HTTP final ${firstResultsStatus} en ${firstResultsFinalUrl}, redirects seguidos: ${redirectsDesc}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, ¿tiene "ddlEstadoProceso" en algún lado del HTML?: ${hasDdlEstado}, ¿tiene título "Búsqueda Avanzada"?: ${hasBusquedaAvanzada}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Recorte ${anchorIdx === -1 ? "(primeros 400 chars, no se encontró ddlEstadoProceso)" : "alrededor de ddlEstadoProceso"}: "${snippet}"`,
-          ],
-        };
-      }
-
-      const allRows: BacRow[] = [...firstPageRows];
-      hidden = extractHiddenFields(firstResultsHtml);
-
-      const totalPages = Math.min(Math.ceil(totalCount / PAGE_SIZE) || 1, MAX_PAGES);
-      for (let page = 2; page <= totalPages; page++) {
-        let pageHtml: string;
         try {
-          const body = buildBody(hidden, "ctl00$CPH1$GridListaPliegos", `Page$${page}`);
-          const pageRes = await fetchWithCookies(
-            BASE_URL,
-            { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
-            jar,
-          );
-          pageHtml = pageRes.html;
+          await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
         } catch (err) {
-          const cause = describeFetchError(err);
-          warnings.push(`Se cortó la paginación en la página ${page}/${totalPages}: ${cause}`);
-          break;
+          const cause = err instanceof Error ? err.message : String(err);
+          throw new Error(`No se pudo abrir la búsqueda avanzada de BAC (${BASE_URL}) con el navegador: ${cause}`);
         }
 
-        const rows = extractDataRows(pageHtml);
-        if (rows.length === 0) {
-          warnings.push(`Página ${page}/${totalPages} no trajo filas — se cortó la paginación ahí.`);
-          break;
+        // Igual que en la versión anterior (fetch): la primera visita "en
+        // frío" puede rebotar a otra página (bootstrap de sesión del WAF).
+        // Si no aparece el select de Estado proceso, reintentamos una vez.
+        let hasForm = (await page.locator(SEL_ESTADO_PROCESO).count()) > 0;
+        if (!hasForm) {
+          warnings.push(
+            `Primera visita a BAC no mostró el formulario de búsqueda (URL final: ${page.url()}) — reintentando una vez.`,
+          );
+          await page.goto(BASE_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS }).catch(() => {});
+          hasForm = (await page.locator(SEL_ESTADO_PROCESO).count()) > 0;
         }
-        allRows.push(...rows);
-        hidden = extractHiddenFields(pageHtml);
-      }
 
-      if (totalCount > 0 && allRows.length !== totalCount) {
-        warnings.push(
-          `BAC reportó ${totalCount} proceso(s) "En Apertura" pero se leyeron ${allRows.length} (posible corte de paginación o cambios durante la lectura).`,
-        );
-      }
-      if (Math.ceil(totalCount / PAGE_SIZE) > MAX_PAGES) {
-        warnings.push(`Se alcanzó el máximo de ${MAX_PAGES} páginas — puede haber procesos sin leer.`);
-      }
+        if (!hasForm) {
+          const snippet = (await page.content()).replace(/\s+/g, " ").trim().slice(0, 400);
+          throw new Error(
+            `BAC no mostró el formulario de búsqueda avanzada después de 2 intentos (URL final: ${page.url()}). Primeros 400 chars: "${snippet}"`,
+          );
+        }
 
-      const tenders = allRows.map(rowToTender);
-      return { tenders, warnings };
+        await page.selectOption(SEL_ESTADO_PROCESO, ESTADO_EN_APERTURA);
+
+        try {
+          await page.click(SEL_BOTON_BUSCAR);
+          await esperarPostback(page);
+        } catch (err) {
+          const cause = err instanceof Error ? err.message : String(err);
+          throw new Error(`Falló el click en "Buscar" (Estado proceso = En Apertura) en BAC: ${cause}`);
+        }
+
+        let html = await page.content();
+        const totalCount = extractTotalCount(html);
+        const firstPageRows = extractDataRows(html);
+
+        if (totalCount === 0 && firstPageRows.length === 0) {
+          const hasGrid = html.includes("GridListaPliegos");
+          const hasEncontrado = html.includes("encontrado");
+          const snippet = html.replace(/\s+/g, " ").trim().slice(0, 400);
+          return {
+            tenders: [],
+            warnings: [
+              `BAC devolvió 0 procesos "En Apertura" tras buscar con el navegador — URL final: ${page.url()}, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}. Primeros 400 chars: "${snippet}"`,
+            ],
+          };
+        }
+
+        const allRows: BacRow[] = [...firstPageRows];
+        const totalPages = Math.min(Math.ceil(totalCount / PAGE_SIZE) || 1, MAX_PAGES);
+
+        for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
+          try {
+            await page.evaluate(
+              ([target, arg]) => {
+                const doPostBack = (
+                  window as unknown as { __doPostBack?: (t: string, a: string) => void }
+                ).__doPostBack;
+                if (doPostBack) doPostBack(target, arg);
+              },
+              ["ctl00$CPH1$GridListaPliegos", `Page$${pageNum}`],
+            );
+          } catch {
+            // Es esperable que evaluate a veces "falle" si el postback
+            // dispara una navegación completa (el contexto de ejecución se
+            // destruye a mitad de camino) — no es un error real, seguimos
+            // igual a esperar que la página termine de cargar.
+          }
+          await esperarPostback(page);
+
+          html = await page.content();
+          const rows = extractDataRows(html);
+          if (rows.length === 0) {
+            warnings.push(`Página ${pageNum}/${totalPages} no trajo filas — se cortó la paginación ahí.`);
+            break;
+          }
+          allRows.push(...rows);
+        }
+
+        if (totalCount > 0 && allRows.length !== totalCount) {
+          warnings.push(
+            `BAC reportó ${totalCount} proceso(s) "En Apertura" pero se leyeron ${allRows.length} (posible corte de paginación o cambios durante la lectura).`,
+          );
+        }
+        if (Math.ceil(totalCount / PAGE_SIZE) > MAX_PAGES) {
+          warnings.push(`Se alcanzó el máximo de ${MAX_PAGES} páginas — puede haber procesos sin leer.`);
+        }
+
+        const tenders = allRows.map(rowToTender);
+        return { tenders, warnings };
+      } finally {
+        await browser.close();
+      }
     },
   };
 }
