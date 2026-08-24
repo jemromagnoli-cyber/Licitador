@@ -353,6 +353,7 @@ export function createBacAperturaSource(): TenderSource {
       }
 
       let firstResultsHtml: string;
+      let firstResultsStatus: number;
       try {
         const body = buildBody(hidden, "ctl00$CPH1$btnListarPliegoAvanzado", "");
         const first = await fetchWithCookies(
@@ -361,6 +362,7 @@ export function createBacAperturaSource(): TenderSource {
           jar,
         );
         firstResultsHtml = first.html;
+        firstResultsStatus = first.status;
       } catch (err) {
         const cause = describeFetchError(err);
         throw new Error(`Falló la búsqueda "Estado proceso = En Apertura" en BAC: ${cause}`);
@@ -370,10 +372,16 @@ export function createBacAperturaSource(): TenderSource {
       const firstPageRows = extractDataRows(firstResultsHtml);
 
       if (totalCount === 0 && firstPageRows.length === 0) {
+        // Diagnóstico (ver el de __VIEWSTATE más arriba, misma idea): si
+        // esto vuelve a pasar, con esto alcanza para saber por qué sin
+        // tener que iterar a ciegas otra vez.
+        const hasGrid = firstResultsHtml.includes("GridListaPliegos");
+        const hasEncontrado = firstResultsHtml.includes("encontrado");
+        const snippet = firstResultsHtml.replace(/\s+/g, " ").trim().slice(0, 400);
         return {
           tenders: [],
           warnings: [
-            'BAC devolvió 0 procesos "En Apertura" (o no se pudo leer el resultado) — revisar si cambió el HTML del buscador en bac-apertura.ts.',
+            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}. Primeros 400 chars: "${snippet}"`,
           ],
         };
       }
