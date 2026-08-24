@@ -77,9 +77,35 @@ const VISIBLE_FIELD_DEFAULTS: Record<string, string> = {
   "ctl00$CPH1$devCbPnlPopupListarProveedor$txtPopupCuitProveedor": "",
 };
 
+// Probado a mano en el navegador (Claude in Chrome): con las cookies de
+// sesión correctas, un POST real de "Buscar" a esta misma URL devuelve 200
+// con resultados (se vieron 712 procesos "En Apertura"), no un redirect. Es
+// decir, el 302 a Default.aspx que veíamos en producción no es "todo POST
+// se bloquea" — es más específico. El sospechoso principal: nuestro
+// User-Agent anterior ("LicitadorBot/1.0...") es un patrón clásico de bot
+// (contiene "compatible;" + "+http", como los crawlers de buscadores). Es
+// común que un WAF (acá, F5 BIG-IP) sea permisivo con bots conocidos en GET
+// (para no romper la indexación) pero bloquee/redirija sus POST (que son
+// "mutación"/acción, no solo lectura). Por eso ahora estos headers imitan
+// una navegación real de Chrome de escritorio (mismo User-Agent y headers
+// Sec-Fetch-*/sec-ch-ua que capturamos del navegador real) en vez de
+// identificarse como bot — los datos que se piden son públicos (el mismo
+// buscador de licitaciones que ve cualquier persona en el sitio de BAC).
 const COMMON_HEADERS: Record<string, string> = {
   "User-Agent":
-    "Mozilla/5.0 (compatible; LicitadorBot/1.0; +https://licitador-production-d3a3.up.railway.app)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
+  "Cache-Control": "max-age=0",
+  "Upgrade-Insecure-Requests": "1",
+  "sec-ch-ua": '"Not_A Brand";v="24", "Chromium";v="151", "Google Chrome";v="151"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Sec-Fetch-Site": "same-origin",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-User": "?1",
+  "Sec-Fetch-Dest": "document",
   Referer: BASE_URL,
   Origin: "https://www.buenosairescompras.gob.ar",
   // Sin esto algunos servidores igual comprimen la respuesta (gzip/br) y,
