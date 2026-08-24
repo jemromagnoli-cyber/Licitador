@@ -277,8 +277,9 @@ async function fetchWithCookies(
   url: string,
   init: { method: "GET" | "POST"; headers?: Record<string, string>; body?: string },
   jar: Map<string, string>,
-): Promise<{ html: string; status: number }> {
+): Promise<{ html: string; status: number; redirects: { status: number; location: string }[]; finalUrl: string }> {
   let currentUrl = url;
+  const redirects: { status: number; location: string }[] = [];
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
     const headers: Record<string, string> = { ...COMMON_HEADERS, ...init.headers };
     const cookieStr = cookieHeader(jar);
@@ -291,11 +292,12 @@ async function fetchWithCookies(
 
     if (res.status >= 300 && res.status < 400 && res.headers.location) {
       const location = Array.isArray(res.headers.location) ? res.headers.location[0] : res.headers.location;
+      redirects.push({ status: res.status, location: location! });
       currentUrl = new URL(location!, currentUrl).toString();
       continue;
     }
 
-    return { html: res.html, status: res.status };
+    return { html: res.html, status: res.status, redirects, finalUrl: currentUrl };
   }
   throw new Error(`Demasiados redirects (>${MAX_REDIRECTS}) siguiendo ${url}`);
 }
@@ -370,6 +372,8 @@ export function createBacAperturaSource(): TenderSource {
 
       let firstResultsHtml: string;
       let firstResultsStatus: number;
+      let firstResultsRedirects: { status: number; location: string }[];
+      let firstResultsFinalUrl: string;
       try {
         const body = buildBody(hidden, "ctl00$CPH1$btnListarPliegoAvanzado", "");
         const first = await fetchWithCookies(
@@ -379,6 +383,8 @@ export function createBacAperturaSource(): TenderSource {
         );
         firstResultsHtml = first.html;
         firstResultsStatus = first.status;
+        firstResultsRedirects = first.redirects;
+        firstResultsFinalUrl = first.finalUrl;
       } catch (err) {
         const cause = describeFetchError(err);
         throw new Error(`Falló la búsqueda "Estado proceso = En Apertura" en BAC: ${cause}`);
@@ -413,10 +419,14 @@ export function createBacAperturaSource(): TenderSource {
                 .slice(Math.max(0, anchorIdx - 200), anchorIdx + 200)
                 .replace(/\s+/g, " ")
                 .trim();
+        const redirectsDesc =
+          firstResultsRedirects.length === 0
+            ? "ninguno"
+            : firstResultsRedirects.map((r) => `${r.status} → ${r.location}`).join(" ; ");
         return {
           tenders: [],
           warnings: [
-            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, ¿tiene "ddlEstadoProceso" en algún lado del HTML?: ${hasDdlEstado}, ¿tiene título "Búsqueda Avanzada"?: ${hasBusquedaAvanzada}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Recorte ${anchorIdx === -1 ? "(primeros 400 chars, no se encontró ddlEstadoProceso)" : "alrededor de ddlEstadoProceso"}: "${snippet}"`,
+            `BAC devolvió 0 procesos "En Apertura" — status HTTP final ${firstResultsStatus} en ${firstResultsFinalUrl}, redirects seguidos: ${redirectsDesc}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, ¿tiene "ddlEstadoProceso" en algún lado del HTML?: ${hasDdlEstado}, ¿tiene título "Búsqueda Avanzada"?: ${hasBusquedaAvanzada}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Recorte ${anchorIdx === -1 ? "(primeros 400 chars, no se encontró ddlEstadoProceso)" : "alrededor de ddlEstadoProceso"}: "${snippet}"`,
           ],
         };
       }
