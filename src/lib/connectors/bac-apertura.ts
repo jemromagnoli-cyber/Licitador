@@ -349,7 +349,27 @@ export function createBacAperturaSource(): TenderSource {
       let initialHtml: string;
       let initialStatus: number;
       try {
-        const initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
+        let initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
+        // Confirmado con el navegador real: la PRIMERA visita "en frío" (sin
+        // cookies previas de este dominio) a BuscarAvanzado.aspx devuelve un
+        // redirect 302 a Default.aspx — parece un bootstrap de sesión del
+        // WAF/balanceador (F5 BIG-IP). fetchWithCookies sigue ese redirect y
+        // termina trayendo el HTML de Default.aspx (que también es ASP.NET y
+        // tiene su propio __VIEWSTATE, por eso no fallaba con "no se pudo
+        // leer __VIEWSTATE" — el problema es que era el VIEWSTATE de otra
+        // página). Repitiendo el mismo GET una segunda vez, ya con las
+        // cookies que quedaron en el jar tras ese primer redirect, el
+        // servidor sí devuelve la página de búsqueda real directamente
+        // (200, sin redirect) — se probó a mano en el navegador y se
+        // reproduce igual. Si el HTML no tiene el campo ddlEstadoProceso es
+        // señal de que no estamos en la página correcta, así que
+        // reintentamos una vez más antes de seguir.
+        if (!initial.html.includes("ddlEstadoProceso")) {
+          warnings.push(
+            `Primer GET a BAC no devolvió la página de búsqueda (aterrizó en ${initial.finalUrl}, status ${initial.status}) — reintentando una vez con las cookies de sesión ya obtenidas.`,
+          );
+          initial = await fetchWithCookies(BASE_URL, { method: "GET" }, jar);
+        }
         initialHtml = initial.html;
         initialStatus = initial.status;
       } catch (err) {
