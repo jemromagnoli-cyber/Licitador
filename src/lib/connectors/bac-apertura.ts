@@ -397,13 +397,26 @@ export function createBacAperturaSource(): TenderSource {
         // el servidor no está atando nuestro body a la sesión/postback.
         const hasGrid = firstResultsHtml.includes("GridListaPliegos");
         const hasEncontrado = firstResultsHtml.includes("encontrado");
+        const hasDdlEstado = firstResultsHtml.includes("ddlEstadoProceso");
+        const hasBusquedaAvanzada = firstResultsHtml.includes("Búsqueda Avanzada") || firstResultsHtml.includes("squeda Avanzada");
         const echoedEstado = extractSelectedOption(firstResultsHtml, "ctl00_CPH1_ddlEstadoProceso");
         const cookieNames = Array.from(jar.keys()).join(", ") || "(ninguna)";
-        const snippet = firstResultsHtml.replace(/\s+/g, " ").trim().slice(0, 400);
+        // El arranque del HTML (doctype/head) es igual en cualquier página
+        // del sitio y no sirve para diferenciar qué página nos devolvió —
+        // en vez de eso, recortamos alrededor de donde debería estar el
+        // campo del formulario, si es que aparece en algún lado.
+        const anchorIdx = firstResultsHtml.indexOf("ddlEstadoProceso");
+        const snippet =
+          anchorIdx === -1
+            ? firstResultsHtml.replace(/\s+/g, " ").trim().slice(0, 400)
+            : firstResultsHtml
+                .slice(Math.max(0, anchorIdx - 200), anchorIdx + 200)
+                .replace(/\s+/g, " ")
+                .trim();
         return {
           tenders: [],
           warnings: [
-            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Primeros 400 chars: "${snippet}"`,
+            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, ¿tiene "ddlEstadoProceso" en algún lado del HTML?: ${hasDdlEstado}, ¿tiene título "Búsqueda Avanzada"?: ${hasBusquedaAvanzada}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Recorte ${anchorIdx === -1 ? "(primeros 400 chars, no se encontró ddlEstadoProceso)" : "alrededor de ddlEstadoProceso"}: "${snippet}"`,
           ],
         };
       }
