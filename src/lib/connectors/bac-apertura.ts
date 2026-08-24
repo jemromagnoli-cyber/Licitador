@@ -131,6 +131,22 @@ function extractHiddenFields(html: string): Record<string, string> {
   return fields;
 }
 
+/** Lee qué opción quedó seleccionada en un <select id="..."> de la respuesta. */
+function extractSelectedOption(html: string, elementId: string): string | undefined {
+  const selectRegex = new RegExp(`<select[^>]*id\\s*=\\s*"${elementId}"[^>]*>([\\s\\S]*?)</select>`, "i");
+  const selectMatch = html.match(selectRegex);
+  if (!selectMatch) return undefined;
+  const optionRegex = /<option\b([^>]*)>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = optionRegex.exec(selectMatch[1])) !== null) {
+    if (/selected/i.test(m[1])) {
+      const valueMatch = m[1].match(/value\s*=\s*"([^"]*)"/i);
+      return valueMatch ? valueMatch[1] : "";
+    }
+  }
+  return undefined;
+}
+
 function extractTotalCount(html: string): number {
   const idx = html.indexOf("encontrado");
   if (idx === -1) return 0;
@@ -374,14 +390,20 @@ export function createBacAperturaSource(): TenderSource {
       if (totalCount === 0 && firstPageRows.length === 0) {
         // Diagnóstico (ver el de __VIEWSTATE más arriba, misma idea): si
         // esto vuelve a pasar, con esto alcanza para saber por qué sin
-        // tener que iterar a ciegas otra vez.
+        // tener que iterar a ciegas otra vez. En particular: si el
+        // servidor "recuerda" que mandamos ddlEstadoProceso=13 (el select
+        // debería volver con ese valor marcado como selected) es señal de
+        // que sí procesó nuestro POST — si vuelve en -2 ("Seleccionar"),
+        // el servidor no está atando nuestro body a la sesión/postback.
         const hasGrid = firstResultsHtml.includes("GridListaPliegos");
         const hasEncontrado = firstResultsHtml.includes("encontrado");
+        const echoedEstado = extractSelectedOption(firstResultsHtml, "ctl00_CPH1_ddlEstadoProceso");
+        const cookieNames = Array.from(jar.keys()).join(", ") || "(ninguna)";
         const snippet = firstResultsHtml.replace(/\s+/g, " ").trim().slice(0, 400);
         return {
           tenders: [],
           warnings: [
-            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}. Primeros 400 chars: "${snippet}"`,
+            `BAC devolvió 0 procesos "En Apertura" — status HTTP ${firstResultsStatus}, body de ${firstResultsHtml.length} chars, ¿tiene tabla de grilla?: ${hasGrid}, ¿tiene texto "encontrado"?: ${hasEncontrado}, valor de Estado proceso que devolvió el servidor: "${echoedEstado ?? "no encontrado"}" (esperábamos "13"), cookies en la sesión: ${cookieNames}. Primeros 400 chars: "${snippet}"`,
           ],
         };
       }
